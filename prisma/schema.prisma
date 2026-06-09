@@ -1,0 +1,309 @@
+// Portal Logístico — schema de dados (SaaS multi-tenant, MVP em SQLite)
+// Isolamento por organização: cada registro de dados tem organizationId e toda
+// consulta é filtrada pela organização do usuário logado (ou pela API key).
+// Para migrar para PostgreSQL: troque provider para "postgresql".
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // conexão "pooled" (Neon -pooler) — usada pela app
+  directUrl = env("DIRECT_URL")   // conexão direta — usada por migrations/db push
+}
+
+// ===========================================================================
+// Organização (tenant). Cada cliente do SaaS é uma Organization.
+// apiKey: usada pelo conector de ERP para ingestão de dados.
+// ===========================================================================
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  apiKey    String   @unique
+  active    Boolean  @default(true)
+  // Webhook de Entrada do Microsoft Teams (via app Workflows/Power Automate).
+  // Gratuito; usado para enviar alertas/escalonamentos a um canal. Opcional.
+  teamsWebhookUrl String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users User[]
+}
+
+// ===========================================================================
+// Usuários e permissões
+// role: SUPER_ADMIN | ADMIN | GESTOR | ANALISTA | VIEWER
+// SUPER_ADMIN é o dono da plataforma (sem organizationId); gerencia as orgs.
+// ===========================================================================
+model User {
+  id           String       @id @default(cuid())
+  name         String
+  email        String       @unique
+  passwordHash String
+  role         String       @default("VIEWER")
+  active       Boolean      @default(true)
+  phone        String? // E.164, ex: +5511999999999 (para WhatsApp)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+
+  uploads      Upload[]
+  escalations  Escalation[]
+  auditLogs    AuditLog[]
+
+  @@index([organizationId])
+}
+
+// ===========================================================================
+// Uploads de arquivos (faturamento, demanda, producao, frete)
+// dataset: faturamento | demanda | producao | frete
+// status:  PENDING | PROCESSING | DONE | ERROR
+// ===========================================================================
+model Upload {
+  id           String   @id @default(cuid())
+  filename     String
+  storagePath  String
+  dataset      String
+  status       String   @default("PENDING")
+  rowsTotal    Int      @default(0)
+  rowsOk       Int      @default(0)
+  rowsError    Int      @default(0)
+  errorMessage String?
+  source       String   @default("upload") // upload | erp
+  createdAt    DateTime @default(now())
+
+  organizationId String
+  uploadedById String?
+  uploadedBy   User?    @relation(fields: [uploadedById], references: [id])
+
+  @@index([organizationId])
+  @@index([dataset])
+  @@index([status])
+}
+
+// ===========================================================================
+// Tabelas de fatos (data warehouse) — todas com organizationId
+// ===========================================================================
+model Faturamento {
+  id        String   @id @default(cuid())
+  organizationId String
+  uploadId  String? // upload de origem (para visualizar/excluir em lote)
+  data      DateTime
+  cliente   String?
+  segmento  String?
+  valor     Float
+  createdAt DateTime @default(now())
+
+  @@index([organizationId, data])
+  @@index([organizationId, segmento])
+  @@index([uploadId])
+}
+
+// Demanda NÃO é prevista: o arquivo traz a demanda do dia e o realizado.
+model Demanda {
+  id         String   @id @default(cuid())
+  organizationId String
+  uploadId   String?
+  data       DateTime
+  sku        String?
+  segmento   String?
+  demanda    Float    @default(0) // demanda registrada no dia
+  realizado  Float    @default(0) // realizado/atendido no dia
+  createdAt  DateTime @default(now())
+
+  @@index([organizationId, data])
+  @@index([organizationId, segmento])
+  @@index([uploadId])
+}
+
+model Producao {
+  id         String   @id @default(cuid())
+  organizationId String
+  uploadId   String?
+  data       DateTime
+  linha      String?
+  produto    String?
+  programado Float    @default(0)
+  realizado  Float    @default(0)
+  createdAt  DateTime @default(now())
+
+  @@index([organizationId, data])
+  @@index([organizationId, linha])
+  @@index([uploadId])
+}
+
+model Frete {
+  id            String   @id @default(cuid())
+  organizationId String
+  uploadId      String?
+  data          DateTime
+  transportadora String?
+  rota          String?
+  custo         Float    @default(0)
+  createdAt     DateTime @default(now())
+
+  @@index([organizationId, data])
+  @@index([organizationId, transportadora])
+  @@index([uploadId])
+}
+
+// ===========================================================================
+// Meta de faturamento diário (por org, muda a cada mês — yyyy-MM).
+// ===========================================================================
+model MetaFaturamento {
+  id           String   @id @default(cuid())
+  organizationId String
+  mes          String // yyyy-MM
+  metaDiaria   Float
+  fonte        String   @default("projecao") // projecao | ia | manual
+  tendencia    String   @default("estavel") // alta | estavel | baixa
+  justificativa String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([organizationId, mes])
+}
+
+// ===========================================================================
+// Motor de alertas (regras e alertas por organização)
+// operator: gt | lt | gte | lte
+// ===========================================================================
+model AlertRule {
+  id            String   @id @default(cuid())
+  organizationId String
+  name          String
+  module        String // faturamento | demanda | producao | frete | variacao
+  metric        String
+  operator      String   @default("lt")
+  yellowThreshold Float?
+  redThreshold  Float?
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  alerts        Alert[]
+
+  @@index([organizationId])
+}
+
+// severity: YELLOW | RED
+// status:   OPEN | ACKNOWLEDGED | RESOLVED
+model Alert {
+  id        String     @id @default(cuid())
+  organizationId String
+  ruleId    String?
+  rule      AlertRule? @relation(fields: [ruleId], references: [id])
+  module    String
+  metric    String
+  severity  String
+  value     Float
+  message   String
+  status    String     @default("OPEN")
+  createdAt DateTime   @default(now())
+
+  notifications Notification[]
+
+  @@index([organizationId, status])
+  @@index([severity])
+}
+
+// ===========================================================================
+// Escalonamento (por organização)
+// ===========================================================================
+model Escalation {
+  id            String   @id @default(cuid())
+  organizationId String
+  module        String
+  title         String
+  description   String
+  priority      String   @default("MEDIA")
+  status        String   @default("ABERTO")
+  contactEmails String? // lista separada por vírgula
+  contactPhones String? // lista separada por vírgula (E.164)
+
+  // ----- Campos do formato padronizado de alerta -----
+  nivel              String  @default("RED") // RED | YELLOW
+  fornecedorCliente  String? // ex: SCANIA
+  componenteCodigo   String? // ex: 1516890
+  componenteDescricao String? // ex: Prateleira High
+  origemMaterial     String? // ex: ACABADO
+  motivo             String? // ex: ATRASO DE ENTREGAS
+  observacao         String? // texto longo
+  consumoCmd         Float? // Consumo (CMD)
+  estoquePlascar     Float? // Estoque Plascar
+  setorProdutivo     String? // ex: MONTAGEM
+  coberturaCliente   Float? // Cobertura no Cliente (dias)
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  createdById   String
+  createdBy     User     @relation(fields: [createdById], references: [id])
+
+  notifications Notification[]
+
+  @@index([organizationId, status])
+}
+
+// ===========================================================================
+// Destinatários salvos de notificação (lista reutilizável por organização).
+// ===========================================================================
+model Contact {
+  id        String   @id @default(cuid())
+  organizationId String
+  email     String
+  phone     String?  // E.164, ex: +5511999999999 (para WhatsApp). Opcional.
+  name      String?
+  active    Boolean  @default(true) // marcado por padrão nos novos escalonamentos
+  createdAt DateTime @default(now())
+
+  @@unique([organizationId, email])
+  @@index([organizationId])
+}
+
+// ===========================================================================
+// Log de notificações enviadas (e-mail / whatsapp)
+// channel: EMAIL | WHATSAPP   status: SENT | SIMULATED | FAILED
+// ===========================================================================
+model Notification {
+  id           String      @id @default(cuid())
+  organizationId String
+  channel      String
+  destination  String
+  subject      String?
+  body         String
+  status       String
+  providerInfo String?
+  createdAt    DateTime    @default(now())
+
+  alertId      String?
+  alert        Alert?      @relation(fields: [alertId], references: [id])
+  escalationId String?
+  escalation   Escalation? @relation(fields: [escalationId], references: [id])
+
+  @@index([organizationId])
+  @@index([channel])
+  @@index([status])
+}
+
+// ===========================================================================
+// Auditoria de acessos e ações (por organização)
+// ===========================================================================
+model AuditLog {
+  id        String   @id @default(cuid())
+  organizationId String?
+  action    String
+  target    String?
+  detail    String?
+  createdAt DateTime @default(now())
+
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+
+  @@index([organizationId])
+  @@index([action])
+}
